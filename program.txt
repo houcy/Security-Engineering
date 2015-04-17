@@ -1,0 +1,81 @@
+Write up on the logic and things done with how to compile the programs in case of manual compiling or Makefile failing.
+____________________________________________________________________________________________________________________________________
+
+----- Write up -----
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+*** Part 1 ***
+
+The code works in a way that it defines a string in the text section and directly jumps to the MESSAGE label as the program starts
+The first instruction in this label is the "CALL" instruction, so essentially as we hit the CALL instruction the next instruction 
+which is the actual Hello World string is pushed onto the stack.
+As we did a CALL to GOBACK label so the code now branches to this label thus putting the required values in eax and ebx registers
+which would result in printing of the string that was pushed onto the stack. We then pop the top of the stack which was our string
+"HELLO WORLD" and give it to ecx and issue a interrupt call. This now prints the message on the screen and later exits the code.
+
+Write Error Handling : Bonus part
+In case the write system call fails the eax register would now contain a negative value. So every time after the write sys call 
+I run a code to check the return value in the eax register. In case its negative then I branch the code to a lable "ERROR" and 
+print a string called "Error occurred" and I safely exit the program there and then.   
+
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+*** Part 2 ***
+
+Essentially to do this part I first run part1.asm program. Then I get the output of objdump and using the command line I loop 
+over the entire output of objdump with a grep to find the hex addresses in the output. I dump the output on the screen and pass
+it to the part2.c program. 
+A large buffer is declared and the shellcode is copied into it and the shell code is now fed to run and display hello world by 
+taking the address of the string 'big_buff <---> shell' and treating it as a pointer to a function that takes an indeterminate 
+set of arguments and returns no values and executes it with no arguments. Thus, resulting in printing Hello World on the screen.
+
++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+*** Part 3 ***
+Inorder to redirect the flow of function. Add any random buffer with any number of bytes and then move these many bytes past the main buffer decleration to reach the top of the buffer, then add 8 to reach 
+the return address and by using objdump add the function address where you want to branch. Thus,
+overwriting the flow and moving to this new function. 
+
+Something like this --> (*(unsigned long *)(charbuf + 80 + 8)) = (unsigned long *)0x0000000000400614;
+
+*** Part 3 _ Vul ***
+For command line input and target changing: Bonus part.
+
+printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x33\x06\x40\x00" | ./part3_vul
+____________________________________________________________________________________________________________________________________
+
+----- Compiling and stuff -----
+
+Part 1 : Writing shell code in x86_64 assembly. 
+
+Running the code:
+nasm -f elf32 shellcode.asm
+ld -m elf_i386 -s -o shellcode shellcode.o
+./shellcode
+
+get the shell code from the ./shellcode 
+--> for i in `objdump -d shellcode | tr '\t' ' ' | tr ' ' '\n' | egrep '^[0-9a-f]{2}$' ` ; do echo -n "\\x$i" ; done
+
+char shellcode [] = \xeb\x1e\xb8\x04\x00\x00\x00\xbb\x01\x00\x00\x00\x59\xba\x0f\x00\x00\x00\xcd\x80\xb8\x01\x00\x00\x00\xbb\x00\x00\x00\x00\xcd\x80\xe8\xdd\xff\xff\xff\x48\x65\x6c\x6c\x6f\x2c\x20\x57\x6f\x72\x6c\x64\x21\x0d\x0a
+
+
+
+Part 2 Execution:
+Compile --> gcc -g -Wall -fno-stack-protector -z execstack part2.c -o part2
+Run ---> ./part2
+
+
+Part 3 Execution:
+Compile --> gcc -fno-stack-protector -z execstack part3.c -o part3
+Run ---> ./part3
+
+
+Compile --> gcc -fno-stack-protector -z execstack part3_vul.c -o part3_vul
+Run ---> ./part3_vul
+Input ---> printf "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x33\x06\x40\x00" | ./part3_vul
+
+____________________________________________________________________________________________________________________________________
+
+
