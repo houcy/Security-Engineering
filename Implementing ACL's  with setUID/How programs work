@@ -1,0 +1,120 @@
+Program name : dir.c(keyword clash in makefile) make_dir.c
+Assuming shagun is running the program.
+
+No Makefile
+gcc make_dir.c 
+./a.out /home/shagun/Desktop/ test
+
+With Makefile
+./make_dir /home/shagun/Desktop/ test
+
+Program checks if there is a ACL or not in this directory. If ACL present then it makes the directory with the permissions given in ACL.
+Else it first reads the permissions of the parent directory and then makes an ACL and then makes the directory with the permissions given
+in the ACL. These are always the inherited permissions.
+____________________________________________________________________________
+
+Program name : fput.c
+
+No Makefile
+gcc fput.c
+./a.out /home/shagun/Desktop/ test "Write text here"
+
+With Makefile
+./fput /home/shagun/Desktop/ test "Write text here"
+
+Program checks if the file name given already exists or not, if not then creates the file and the acl of the file. Also writes the text 
+that the user has given into the file user makes. 
+All files have separate acls to check if the users are allowed to read them or not. 
+ex: user makes file -> test then ACL will be -> testACL.txt
+____________________________________________________________________________
+
+Program name: ls.c (ls keyword clash) --> list.c
+
+No Makefile
+gcc list.c
+./a.out /home/shagun/Desktop/ 
+
+With Makefile
+./list /home/shagun/Desktop/ 
+
+The program will check if the directory has the ACL or not. If no ACL then it will not allow the user to read the directory. No ls allowed.
+Else it will check if the user is the owner of the directory or not. If yes, the it will give access to ls.
+If user doing ls is not the owner, then it will check if the user is in the same group or not. 
+If yes then it will check the ACL file of the directory to see if the group has read permissions or not. If yes, ls allowed. 
+Else there are no permissions for the user. 
+____________________________________________________________________________
+
+Program name : fget.c
+
+No Makefile
+gcc fget.c
+./a.out /home/shagun/Desktop/ test 
+
+With Makefile
+./fget /home/shagun/Desktop/ test 
+
+test here is the file to be read.
+The program will check if the file exists or not, it then checks if the file is being accessed by the owner or not. If owner then rights are given to read else it checks if the group is the same as the group that is allowed to read the file. If yes then read allowed else shows an error.
+
+____________________________________________________________________________
+
+
+Program name : getacl.c
+
+No Makefile
+gcc getacl.c
+./a.out /home/shagun/Desktop test -d 	//for reading the ACL of the directory where test file is.
+./a.out /home/shagun/Desktop test -f	//for reading the ACL of the file.
+
+With Makefile
+./getacl /home/shagun/Desktop test -d 	//for reading the ACL of the directory where test file is.
+./getacl /home/shagun/Desktop test -f	//for reading the ACL of the file.
+
+
+test here is the file name.
+The program checks on the flag if the user wants to read the file acl or the directory acl. As every user is allowed to read the permissons
+The program displays the respective ACL.
+
+____________________________________________________________________________
+
+Program name : setacl.c
+
+No Makefile
+gcc setacl.c
+./a.out /home/shagun/Desktop test -d 	//for writing the ACL of the directory where test file is.
+./a.out /home/shagun/Desktop test -f	//for writing the ACL of the file.
+
+With Makefile
+./setacl /home/shagun/Desktop test -d 	//for writing the ACL of the directory where test file is.
+./setacl /home/shagun/Desktop test -f	//for writing the ACL of the file.
+
+
+The program checks if the person issuing the command is the owner or not. Only owner gets a chance to write the file. No one else.
+If owner then access granted. Else access denied.
+
+____________________________________________________________________________
+
+
+Precautions/Errors checked:
+ 
+1. All programs only accept a set number of parameters. If not given then they show errors.
+2. Too long content for fput shows an error and exits the program. ***Saving against stack smashing attack and buffer overflow*** comment exit in code and see result.
+3. Users rights not apt, then file accesses not allowed if though the linux would allow it the program denies it. 
+4. Other variable boundaries checked.
+5. Notifies user if he tries to use relative addressing. Only absolute addressing is allowed in path traversal. 
+6. Also checks group rights in fget.c in case the group has "read" access. 
+
+____________________________________________________________________________
+
+Assumptions taken:
+1. Three parameters even when checking the ACL file of directory.
+____________________________________________________________________________
+
+System does in general:
+
+1. Runs the specific code with given inputs and checks for an ACL in the given directory. If ACL present then executes the given command accrdingly else creates the ACL and works accrodingly. 
+2. In case an ACL is not needed then it queries the existing ACL and checks for rights and does the job or denies it. 
+3. Delivers an ACL over the existing OS DAC and prioritises the ACL over the system DAC.
+4. Creates an ACL per directory based on the rights of the parent directory. 
+____________________________________________________________________________
+
