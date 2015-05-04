@@ -1,0 +1,64 @@
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  Part 1  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/**********************************************************************************/
+How encrypt.c works:
+The program first takes in a passphrase from the user and hashes it to form the salt.
+The salt is then used to generate the IV and IV is used to generate the Key.
+The key is then used to encrypt the file that is taken as an input from the user.
+Now the encrypted contents are stored in a file named cipher and corresponding HMAC of the salt and cipher are put into a file.
+/**********************************************************************************/
+
+
+/**********************************************************************************/
+How decrypt.c works:
+The program asks for the passphrase and hashes it to check if the passphrase is same as the one which was stored earlier.
+Then the program checks if the file HMAC is same as the HMAC which is now computed. 
+IF(HMAC(early)==HMAC(new)) : Files are okay and allow user to decrypt. 
+Else : The integrity is mismatching. Don't allow decrypt and exit program.
+
+If all checks pass then : Passphrase is used to generate the Salt, IV, Key and then decryption is done.
+
+/**********************************************************************************/
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~  Part 2  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+/**********************************************************************************/
+How rand_gen.c works:
+The program takes the user input of length less than 10 and then changes the input to a random permutation.
+This permutation is encoded in base 64 to increase the entropy.
+This random permutation is stored in the file named random.txt and that is used in the RSA program. 
+
+/**********************************************************************************/
+
+
+/**********************************************************************************/
+How part2.c works:
+
+Input : ./part2 random.txt test
+The program takes the user passphrase and then changes it to hash and form the salt.
+The salt is appended with the random string from rand_gen.c program.
+This salt is used is used to generate the AES symmetric key and then that key is used to encrypt the 
+The message is encrypted using the public key and the decrypted using the private key.
+The key is extracted by decrypting using the private key and then separating the key from the message hash.
+The key is the same as the one we have in the first step --> the random string from rand_gen.
+Now as we have the key we can use this key and decrypt the final message.
+/**********************************************************************************/
+
+
+/**********************************************************************************/
+Errors handled :
+1. Passphrase larger than 10 is not allowed.
+2. If a file is not found the system shows an error and exits.
+3. In case the passphrase doesn't match to what user earlier supplied then decryption is not allowed.
+4. In case the encrypted text hash doesn't match to earlier computed hash then decryption is not allowed.
+5. In case the file integrity is touched then file decryption is not allowed.
+6. In case the random number doesn't match to the earlier used random number in RSA then decryption is not allowed.
+7. All general things like stack smashing and buffer overflows are checked.
+8. Command line input parameters are checked, the number of them supplied.
+/**********************************************************************************/
+
+
+
+
+//shagun security demo engine
